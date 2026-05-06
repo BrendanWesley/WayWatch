@@ -1,95 +1,66 @@
 #!/usr/bin/env python3
-"""
-Smart Road Quality Monitoring System - Pothole Detection Module
-Captures webcam feed, detects pothole-like objects, and reports to backend
-"""
+
+import os
+import sys
+import time
+from pathlib import Path
+from threading import Thread
 
 import cv2
 import numpy as np
-import os
 import requests
-import sys
-import time
-from threading import Thread
+from tensorflow.keras.layers import DepthwiseConv2D
+from tensorflow.keras.models import load_model
 
-# Backend API endpoint
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("MODEL_PATH", BASE_DIR / "keras_model.h5"))
+LABELS_PATH = Path(os.getenv("LABELS_PATH", BASE_DIR / "label.txt"))
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:3000/report")
+BACKEND_BASE_URL = BACKEND_URL.rsplit("/", 1)[0]
+DEVICE_LOCATION_URL = os.getenv(
+    "DEVICE_LOCATION_URL",
+    f"{BACKEND_BASE_URL}/device-location",
+)
 
-# Fallback coordinates are used only if live/device location is unavailable.
 FALLBACK_LAT = float(os.getenv("DEVICE_LAT", "13.0827"))
 FALLBACK_LNG = float(os.getenv("DEVICE_LNG", "80.2707"))
+REPORT_INTERVAL = float(os.getenv("REPORT_INTERVAL", "2.0"))
+POTHOLE_THRESHOLD = float(os.getenv("POTHOLE_THRESHOLD", "0.90"))
 
-# Detection sensitivity parameters
-BLUR_KERNEL = (7, 7)
-THRESHOLD_VALUE = 75
-MIN_CONTOUR_AREA = 1200
-MAX_CONTOUR_AREA = 100000
-MIN_ASPECT_RATIO = 0.35
-MAX_ASPECT_RATIO = 3.2
-MIN_DARK_RATIO = 0.35
-REPORT_INTERVAL = 1.0
 DEFAULT_ADDRESS = {
     "street": "Unknown street",
     "area": "Unknown area",
     "pincode": "Unknown pincode",
-    "displayName": "Address unavailable"
+    "displayName": "Address unavailable",
 }
 
 
-def calculate_severity(bbox_area, impact=False):
-    """
-    Calculate pothole severity based on bounding box area and impact
-    Args:
-        bbox_area: Area of detected bounding box
-        impact: Boolean indicating high impact (keyboard press)
-    Returns:
-        severity: 1 (small), 2 (medium), or 3 (large)
-    """
-    if impact:
-        return 3  # High impact detected
-    
-    # Area-based severity
-    if bbox_area > 15000:
-        return 3  # Large pothole
-    elif bbox_area > 5000:
-        return 2  # Medium pothole
-    else:
-        return 1  # Small pothole
+class CompatibleDepthwiseConv2D(DepthwiseConv2D):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop("groups", None)
+        super().__init__(*args, **kwargs)
 
 
-def send_pothole_report(severity, lat, lng, address):
-    """
-    Send pothole detection report to backend
-    Args:
-        severity: Severity level (1-3)
-        lat: Latitude
-        lng: Longitude
-    """
-    payload = {
-        "type": "pothole",
-        "severity": severity,
-        "source": "webcam",
-        "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "location": {
-            "lat": lat,
-            "lng": lng
-        },
-        "address": address
-    }
-    
-    try:
-        response = requests.post(BACKEND_URL, json=payload, timeout=2)
-        if response.status_code == 200:
-            print(
-                "✓ Pothole reported: "
-                f"severity={severity}, lat={lat}, lng={lng}, "
-                f"street={address['street']}, area={address['area']}, "
-                f"pincode={address['pincode']}"
-            )
-        else:
-            print(f"✗ Backend error: {response.status_code}")
-    except Exception as e:
-        print(f"✗ Connection error: {e}")
+def load_labels():
+    if not LABELS_PATH.exists():
+        raise FileNotFoundError(f"Labels file not found: {LABELS_PATH}")
+
+    labels = [line.strip() for line in LABELS_PATH.read_text().splitlines() if line.strip()]
+    if not labels:
+        raise ValueError(f"Labels file is empty: {LABELS_PATH}")
+    return labels
+
+
+def load_teachable_machine_model():
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+
+    return load_model(
+        MODEL_PATH,
+        compile=False,
+        custom_objects={"DepthwiseConv2D": CompatibleDepthwiseConv2D},
+    )
 
 
 def first_present(data, keys):
@@ -101,10 +72,6 @@ def first_present(data, keys):
 
 
 def reverse_geocode(lat, lng):
-    """
-    Convert coordinates into street, area, and pincode.
-    Uses OpenStreetMap Nominatim when internet is available.
-    """
     try:
         response = requests.get(
             "https://nominatim.openstreetmap.org/reverse",
@@ -113,250 +80,217 @@ def reverse_geocode(lat, lng):
                 "lon": lng,
                 "format": "jsonv2",
                 "zoom": 18,
-                "addressdetails": 1
+                "addressdetails": 1,
             },
-            headers={
-                "User-Agent": "pothole-project/1.0"
-            },
-            timeout=4
+            headers={"User-Agent": "pothole-project/1.0"},
+            timeout=4,
         )
         response.raise_for_status()
         data = response.json()
         raw_address = data.get("address", {})
 
-        street = first_present(
-            raw_address,
-            ["road", "pedestrian", "footway", "residential", "path", "suburb"]
-        )
-        area = first_present(
-            raw_address,
-            [
-                "neighbourhood",
-                "suburb",
-                "quarter",
-                "city_district",
-                "county",
-                "city",
-                "town",
-                "village"
-            ]
-        )
-        pincode = raw_address.get("postcode")
-
-        address = {
-            "street": street or DEFAULT_ADDRESS["street"],
-            "area": area or DEFAULT_ADDRESS["area"],
-            "pincode": pincode or DEFAULT_ADDRESS["pincode"],
-            "displayName": data.get("display_name") or DEFAULT_ADDRESS["displayName"]
+        return {
+            "street": first_present(
+                raw_address,
+                ["road", "pedestrian", "footway", "residential", "path", "suburb"],
+            )
+            or DEFAULT_ADDRESS["street"],
+            "area": first_present(
+                raw_address,
+                [
+                    "neighbourhood",
+                    "suburb",
+                    "quarter",
+                    "city_district",
+                    "county",
+                    "city",
+                    "town",
+                    "village",
+                ],
+            )
+            or DEFAULT_ADDRESS["area"],
+            "pincode": raw_address.get("postcode") or DEFAULT_ADDRESS["pincode"],
+            "displayName": data.get("display_name") or DEFAULT_ADDRESS["displayName"],
         }
-        print(
-            "Resolved address: "
-            f"{address['street']}, {address['area']} - {address['pincode']}"
-        )
-        return address
-    except Exception as e:
-        print(f"Reverse geocoding unavailable: {e}")
+    except Exception as exc:
+        print(f"Reverse geocoding unavailable: {exc}")
         return DEFAULT_ADDRESS.copy()
 
 
-def get_device_location():
-    """
-    Resolve the current device location.
-
-    Priority:
-    1. DEVICE_LAT and DEVICE_LNG environment variables for exact demo control.
-    2. IP-based location lookup, which works without GPS but is approximate.
-    3. Chennai fallback coordinates.
-    """
-    if "DEVICE_LAT" in os.environ and "DEVICE_LNG" in os.environ:
-        print(f"Using location from env: {FALLBACK_LAT}, {FALLBACK_LNG}")
-        return FALLBACK_LAT, FALLBACK_LNG
-
+def get_backend_device_location():
     try:
-        response = requests.get("https://ipapi.co/json/", timeout=3)
+        response = requests.get(DEVICE_LOCATION_URL, timeout=2)
         response.raise_for_status()
         data = response.json()
-        lat = data.get("latitude")
-        lng = data.get("longitude")
+        location = data.get("location", {})
+        lat = location.get("lat")
+        lng = location.get("lng")
         if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
-            print(f"Using approximate device location: {lat}, {lng}")
-            return float(lat), float(lng)
-    except Exception as e:
-        print(f"Location lookup unavailable: {e}")
+            address = data.get("address") or reverse_geocode(float(lat), float(lng))
+            return float(lat), float(lng), address
+    except Exception as exc:
+        print(f"Backend device location unavailable: {exc}")
 
-    print(f"Using fallback location: {FALLBACK_LAT}, {FALLBACK_LNG}")
-    return FALLBACK_LAT, FALLBACK_LNG
-
-
-def is_pothole_candidate(area, x, y, w, h, thresh):
-    """
-    Filter dark regions so regular shadows/noise are less likely to report.
-    This is a demo detector, not a trained model.
-    """
-    if not (MIN_CONTOUR_AREA < area < MAX_CONTOUR_AREA):
-        return False
-
-    aspect_ratio = w / float(h)
-    if aspect_ratio < MIN_ASPECT_RATIO or aspect_ratio > MAX_ASPECT_RATIO:
-        return False
-
-    roi = thresh[y:y + h, x:x + w]
-    dark_ratio = cv2.countNonZero(roi) / float(w * h)
-    return dark_ratio >= MIN_DARK_RATIO
+    return None
 
 
-def detect_potholes(frame):
-    """
-    Detect pothole-like regions in frame
-    Args:
-        frame: Input frame from webcam
-    Returns:
-        List of (x, y, w, h, area) tuples and processed frame
-    """
-    # Convert to grayscale
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Apply Gaussian blur to reduce noise.
-    blurred = cv2.GaussianBlur(gray, BLUR_KERNEL, 0)
-    
-    # Detect dark regions. This works well for a printed/displayed pothole image.
-    _, fixed_thresh = cv2.threshold(
-        blurred,
-        THRESHOLD_VALUE,
-        255,
-        cv2.THRESH_BINARY_INV
-    )
-    adaptive_thresh = cv2.adaptiveThreshold(
-        blurred,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        7
-    )
-    thresh = cv2.bitwise_or(fixed_thresh, adaptive_thresh)
-    
-    # Morphological operations to clean up
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-    
-    # Find contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    detections = []
-    processed_frame = frame.copy()
-    
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        x, y, w, h = cv2.boundingRect(contour)
+def get_report_location():
+    backend_location = get_backend_device_location()
+    if backend_location:
+        lat, lng, address = backend_location
+        return lat, lng, address
 
-        if is_pothole_candidate(area, x, y, w, h, thresh):
-            detections.append((x, y, w, h, area))
-            
-            # Draw bounding box
-            cv2.rectangle(processed_frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(
-                processed_frame,
-                f"Pothole? area={int(area)}",
-                (x, max(y - 10, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 0, 255),
-                2
-            )
-    
-    return detections, processed_frame
+    address = reverse_geocode(FALLBACK_LAT, FALLBACK_LNG)
+    return FALLBACK_LAT, FALLBACK_LNG, address
+
+
+def calculate_severity(high_impact=False):
+    return 3 if high_impact else 2
+
+
+def send_pothole_report(severity, lat, lng, address):
+    payload = {
+        "type": "pothole",
+        "severity": severity,
+        "source": "webcam",
+        "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "location": {"lat": lat, "lng": lng},
+        "address": address,
+    }
+
+    try:
+        response = requests.post(BACKEND_URL, json=payload, timeout=3)
+        response.raise_for_status()
+        print(
+            "Reported pothole | "
+            f"severity={severity} | lat={lat} | lng={lng} | "
+            f"street={address['street']} | area={address['area']} | "
+            f"pincode={address['pincode']}"
+        )
+    except Exception as exc:
+        print(f"Connection error while reporting pothole: {exc}")
+
+
+def preprocess_frame(frame, input_shape):
+    _, height, width, channels = input_shape
+    if channels != 3:
+        raise ValueError(f"Unsupported channel count from model: {channels}")
+
+    image = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    image = np.asarray(image, dtype=np.float32)
+    image = (image / 127.5) - 1.0
+    return image.reshape(1, height, width, channels)
+
+
+def parse_prediction(prediction, class_names):
+    scores = np.asarray(prediction[0]).astype(np.float32).flatten()
+
+    if scores.size == 1:
+        pothole_score = float(scores[0])
+        label = class_names[0]
+        return label, pothole_score, pothole_score >= POTHOLE_THRESHOLD
+
+    index = int(np.argmax(scores))
+    label = class_names[index] if index < len(class_names) else f"class_{index}"
+    confidence = float(scores[index])
+    is_pothole = "pothole" in label.lower() and confidence >= POTHOLE_THRESHOLD
+    return label, confidence, is_pothole
 
 
 def run_detection():
-    """
-    Main detection loop
-    """
-    # Open webcam
+    try:
+        model = load_teachable_machine_model()
+        class_names = load_labels()
+    except Exception as exc:
+        print(f"Failed to load Teachable Machine assets: {exc}")
+        sys.exit(1)
+
     cap = cv2.VideoCapture(0)
-    
     if not cap.isOpened():
         print("Error: Cannot access webcam")
         sys.exit(1)
-    
-    # Set resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    lat, lng = get_device_location()
-    address = reverse_geocode(lat, lng)
 
-    print("🚗 Pothole Detection System Started")
-    print(f"Backend: {BACKEND_URL}")
-    print(f"Report location: lat={lat}, lng={lng}")
-    print(
-        "Report address: "
-        f"{address['street']}, {address['area']} - {address['pincode']}"
-    )
-    print("Show a pothole image to the webcam.")
-    print("Press 'P' to simulate high impact / 'R' to refresh location / 'Q' to quit")
+    print("Smart Road Quality Monitoring Started")
+    print(f"Model: {MODEL_PATH.name}")
+    print(f"Labels: {LABELS_PATH.name}")
+    print("Show a pothole image/video to the webcam")
+    print("Press P for a severe pothole, R to refresh location, Q to quit")
     print("=" * 50)
-    
-    last_report_time = 0
-    
+
+    lat, lng, address = get_report_location()
+    print(
+        f"Initial location: {lat}, {lng} | "
+        f"{address['street']}, {address['area']} {address['pincode']}"
+    )
+
+    last_report_time = 0.0
+
     try:
         while True:
             ret, frame = cap.read()
-            
             if not ret:
-                print("Error: Failed to read frame")
+                print("Error reading frame")
                 break
-            
-            # Detect potholes
-            detections, processed_frame = detect_potholes(frame)
-            
-            # Report detections
+
+            image = preprocess_frame(frame, model.input_shape)
+            prediction = model.predict(image, verbose=0)
+            class_name, confidence_score, is_pothole = parse_prediction(
+                prediction, class_names
+            )
+
+            overlay_color = (0, 0, 255) if is_pothole else (0, 255, 0)
+            cv2.putText(
+                frame,
+                f"{class_name} ({confidence_score:.2f})",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                overlay_color,
+                2,
+            )
+
             current_time = time.time()
-            if detections and (current_time - last_report_time) > REPORT_INTERVAL:
-                # Get keyboard input (non-blocking)
-                key = cv2.waitKey(1) & 0xFF
-                
-                impact = key == ord('p') or key == ord('P')
-                
-                for x, y, w, h, area in detections:
-                    severity = calculate_severity(area, impact)
-                    
-                    # Send report asynchronously
-                    Thread(
-                        target=send_pothole_report,
-                        args=(severity, lat, lng, address),
-                        daemon=True
-                    ).start()
-                
+            if is_pothole and (current_time - last_report_time) > REPORT_INTERVAL:
+                lat, lng, address = get_report_location()
+
+                print("Pothole detected")
+                print(f"Confidence: {confidence_score:.2f}")
+                print(f"Location: {lat}, {lng}")
+
+                Thread(
+                    target=send_pothole_report,
+                    args=(calculate_severity(False), lat, lng, address),
+                    daemon=True,
+                ).start()
+
                 last_report_time = current_time
-            
-            # Display frame
-            cv2.imshow("Pothole Detection", processed_frame)
-            
-            # Handle keyboard input
+
+            cv2.imshow("Pothole Detection", frame)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == ord('Q'):
-                print("\n🛑 Stopping detection system...")
+
+            if key in (ord("q"), ord("Q")):
+                print("Stopping system...")
                 break
-            elif key == ord('p') or key == ord('P'):
-                print("💥 High impact detected!")
-            elif key == ord('r') or key == ord('R'):
-                lat, lng = get_device_location()
-                address = reverse_geocode(lat, lng)
-                print(f"Report location refreshed: lat={lat}, lng={lng}")
+
+            if key in (ord("p"), ord("P")) and is_pothole:
+                lat, lng, address = get_report_location()
+                Thread(
+                    target=send_pothole_report,
+                    args=(calculate_severity(True), lat, lng, address),
+                    daemon=True,
+                ).start()
+                print("High impact pothole reported")
+                last_report_time = time.time()
+
+            if key in (ord("r"), ord("R")):
+                lat, lng, address = get_report_location()
                 print(
-                    "Report address refreshed: "
-                    f"{address['street']}, {address['area']} - {address['pincode']}"
+                    f"Location refreshed: {lat}, {lng} | "
+                    f"{address['street']}, {address['area']} {address['pincode']}"
                 )
-    
-    except KeyboardInterrupt:
-        print("\n🛑 Interrupted by user")
-    
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        print("✓ Detection system stopped")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ export default function PotholeMap({
   return (
     <View style={styles.panel}>
       <View style={styles.centerMarker}>
-        <Text style={styles.centerTitle}>Chennai Road Monitor</Text>
+        <Text style={styles.centerTitle}>Current Device Location</Text>
         <Text style={styles.centerCoords}>
           {initialRegion.latitude.toFixed(4)}, {initialRegion.longitude.toFixed(4)}
         </Text>
@@ -49,7 +49,7 @@ function PotholeRow({ pothole, severityColors, severityLabels, onPotholePress })
       <View style={styles.rowText}>
         <Text style={styles.rowTitle}>Pothole #{pothole.id}</Text>
         <Text style={styles.rowMeta}>
-          {severityLabels[pothole.severity]} · {pothole.count} confirmations
+          {severityLabels[pothole.severity]} · {pothole.detectionCount || 1} detections · {pothole.count || 0} confirmations
         </Text>
         <Text style={styles.rowAddress}>
           {address.street || "Unknown street"}, {address.area || "Unknown area"}

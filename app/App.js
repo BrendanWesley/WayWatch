@@ -10,6 +10,7 @@ import {
   ScrollView,
 } from "react-native";
 import axios from "axios";
+import * as Location from "expo-location";
 import PotholeMap from "./components/PotholeMap";
 
 /**
@@ -27,8 +28,7 @@ const BACKEND_HOST =
     : BACKEND_IP;
 const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
 
-// Chennai coordinates
-const INITIAL_REGION = {
+const DEFAULT_REGION = {
   latitude: 13.0827,
   longitude: 80.2707,
   latitudeDelta: 0.05,
@@ -53,6 +53,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [stats, setStats] = useState(null);
   const [error, setError] = useState(null);
+  const [currentRegion, setCurrentRegion] = useState(DEFAULT_REGION);
 
   /**
    * Fetch potholes from backend
@@ -87,6 +88,68 @@ export default function App() {
     }
   };
 
+  const buildAddress = (reverseGeocodeResult) => ({
+    street:
+      reverseGeocodeResult?.street ||
+      reverseGeocodeResult?.name ||
+      "Unknown street",
+    area:
+      reverseGeocodeResult?.district ||
+      reverseGeocodeResult?.subregion ||
+      reverseGeocodeResult?.city ||
+      "Unknown area",
+    pincode: reverseGeocodeResult?.postalCode || "Unknown pincode",
+    displayName: [
+      reverseGeocodeResult?.street || reverseGeocodeResult?.name,
+      reverseGeocodeResult?.district ||
+        reverseGeocodeResult?.subregion ||
+        reverseGeocodeResult?.city,
+      reverseGeocodeResult?.postalCode,
+    ]
+      .filter(Boolean)
+      .join(", "),
+  });
+
+  const publishCurrentDeviceLocation = async () => {
+    try {
+      const permission = await Location.requestForegroundPermissionsAsync();
+      if (permission.status !== "granted") {
+        console.log("Location permission denied");
+        return;
+      }
+
+      const position = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+      const location = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+      };
+      const [reverseGeocodeResult] = await Location.reverseGeocodeAsync({
+        latitude: location.lat,
+        longitude: location.lng,
+      });
+
+      setCurrentRegion({
+        latitude: location.lat,
+        longitude: location.lng,
+        latitudeDelta: 0.02,
+        longitudeDelta: 0.02,
+      });
+
+      await axios.post(
+        `${BACKEND_URL}/device-location`,
+        {
+          location,
+          address: buildAddress(reverseGeocodeResult),
+        },
+        { timeout: 5000 }
+      );
+    } catch (err) {
+      console.log("Location publish error:", err.message);
+    }
+  };
+
   /**
    * Confirm pothole existence (user action)
    */
@@ -117,7 +180,7 @@ export default function App() {
 
     Alert.alert(
       "Pothole Confirmation",
-      `Severity: ${SEVERITY_LABELS[pothole.severity]}\nConfirmations: ${pothole.count}\nStreet: ${address.street || "Unknown street"}\nArea: ${address.area || "Unknown area"}\nPincode: ${address.pincode || "Unknown pincode"}`,
+      `Severity: ${SEVERITY_LABELS[pothole.severity]}\nDetections: ${pothole.detectionCount || 1}\nConfirmations: ${pothole.count || 0}\nStreet: ${address.street || "Unknown street"}\nArea: ${address.area || "Unknown area"}\nPincode: ${address.pincode || "Unknown pincode"}`,
       [
         {
           text: "Still exists (Yes)",
@@ -139,6 +202,7 @@ export default function App() {
 
   // Fetch potholes every second so webcam detections appear quickly.
   useEffect(() => {
+    publishCurrentDeviceLocation();
     fetchPotholes();
     fetchStats();
 
@@ -147,7 +211,12 @@ export default function App() {
       fetchStats();
     }, 1000);
 
-    return () => clearInterval(interval);
+    const locationInterval = setInterval(publishCurrentDeviceLocation, 30000);
+
+    return () => {
+      clearInterval(interval);
+      clearInterval(locationInterval);
+    };
   }, []);
 
   return (
@@ -174,7 +243,7 @@ export default function App() {
       ) : (
         <>
           <PotholeMap
-            initialRegion={INITIAL_REGION}
+            initialRegion={currentRegion}
             potholes={potholes}
             severityColors={SEVERITY_COLORS}
             severityLabels={SEVERITY_LABELS}

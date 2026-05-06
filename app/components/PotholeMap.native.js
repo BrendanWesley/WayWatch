@@ -57,7 +57,10 @@ function PotholeMarker({
             Severity: {severityLabels[pothole.severity]}
           </Text>
           <Text style={styles.calloutText}>
-            Confirmations: {pothole.count}
+            Detections: {pothole.detectionCount || 1}
+          </Text>
+          <Text style={styles.calloutText}>
+            Confirmations: {pothole.count || 0}
           </Text>
           <Text style={styles.calloutText}>
             Street: {address.street || "Unknown street"}

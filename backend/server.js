@@ -15,6 +15,7 @@ app.use(express.json());
 // In-memory storage
 let potholes = [];
 let nextId = 1;
+let currentDeviceLocation = null;
 
 // Constants
 const PROXIMITY_THRESHOLD = 0.001; // ~100 meters in lat/lng
@@ -60,6 +61,56 @@ function normalizeAddress(address) {
   };
 }
 
+function normalizeLocation(location) {
+  if (!location) {
+    return null;
+  }
+
+  const lat = Number(location.lat);
+  const lng = Number(location.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  return { lat, lng };
+}
+
+/**
+ * POST /device-location - Store the latest app/device GPS location
+ * Body: { location: { lat, lng }, address? }
+ */
+app.post("/device-location", (req, res) => {
+  const location = normalizeLocation(req.body.location);
+
+  if (!location) {
+    return res.status(400).json({
+      error: "Missing or invalid location: { lat, lng }",
+    });
+  }
+
+  currentDeviceLocation = {
+    location,
+    address: normalizeAddress(req.body.address),
+    updatedAt: new Date().toISOString(),
+  };
+
+  res.json({
+    status: "updated",
+    deviceLocation: currentDeviceLocation,
+  });
+});
+
+/**
+ * GET /device-location - Retrieve the latest app/device GPS location
+ */
+app.get("/device-location", (req, res) => {
+  if (!currentDeviceLocation) {
+    return res.status(404).json({ error: "Device location not available yet" });
+  }
+
+  res.json(currentDeviceLocation);
+});
+
 /**
  * POST /report - Report a new pothole
  * Body: { type, severity, location: { lat, lng }, address? }
@@ -78,7 +129,14 @@ app.post("/report", (req, res) => {
     return res.status(400).json({ error: "Severity must be 1-3" });
   }
 
-  const { lat, lng } = location;
+  const normalizedLocation = normalizeLocation(location);
+  if (!normalizedLocation) {
+    return res.status(400).json({
+      error: "Invalid location: lat and lng must be numbers",
+    });
+  }
+
+  const { lat, lng } = normalizedLocation;
   const normalizedAddress = normalizeAddress(address);
 
   // Check if nearby pothole exists (clustering logic)
@@ -86,7 +144,7 @@ app.post("/report", (req, res) => {
 
   if (existingPothole) {
     // Update existing pothole
-    existingPothole.count += 1;
+    existingPothole.detectionCount = (existingPothole.detectionCount || 1) + 1;
     existingPothole.severity = Math.max(existingPothole.severity, severity);
     existingPothole.location = { lat, lng };
     existingPothole.address = normalizedAddress;
@@ -95,13 +153,14 @@ app.post("/report", (req, res) => {
     existingPothole.lastUpdated = new Date().toISOString();
 
     console.log(
-      `✓ Updated pothole ID ${existingPothole.id}: count=${existingPothole.count}, severity=${existingPothole.severity}`
+      `✓ Updated pothole ID ${existingPothole.id}: detections=${existingPothole.detectionCount}, confirmations=${existingPothole.count}, severity=${existingPothole.severity}`
     );
 
     return res.json({
       status: "updated",
       id: existingPothole.id,
       count: existingPothole.count,
+      detectionCount: existingPothole.detectionCount,
       severity: existingPothole.severity,
       address: existingPothole.address,
     });
@@ -115,7 +174,8 @@ app.post("/report", (req, res) => {
       address: normalizedAddress,
       source: source || "unknown",
       capturedAt: capturedAt || null,
-      count: 1,
+      detectionCount: 1,
+      count: 0,
       confirmed: false,
       createdAt: new Date().toISOString(),
       lastUpdated: new Date().toISOString(),
@@ -260,6 +320,8 @@ app.listen(PORT, () => {
 Endpoints:
   POST   /report        - Report a pothole
   GET    /potholes      - Get all potholes
+  POST   /device-location - Update current device location
+  GET    /device-location - Get current device location
   POST   /confirm       - Confirm pothole existence
   DELETE /potholes/:id  - Delete a pothole
   GET    /stats         - Get system statistics
