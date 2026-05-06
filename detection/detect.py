@@ -27,6 +27,11 @@ FALLBACK_LAT = float(os.getenv("DEVICE_LAT", "13.0827"))
 FALLBACK_LNG = float(os.getenv("DEVICE_LNG", "80.2707"))
 REPORT_INTERVAL = float(os.getenv("REPORT_INTERVAL", "2.0"))
 POTHOLE_THRESHOLD = float(os.getenv("POTHOLE_THRESHOLD", "0.90"))
+STABLE_DETECTION_FRAMES = int(os.getenv("STABLE_DETECTION_FRAMES", "4"))
+CALIBRATION_FRAMES = int(os.getenv("CALIBRATION_FRAMES", "30"))
+CALIBRATION_MARGIN = float(os.getenv("CALIBRATION_MARGIN", "0.08"))
+MAX_DYNAMIC_THRESHOLD = float(os.getenv("MAX_DYNAMIC_THRESHOLD", "0.995"))
+NO_POTHOLE_LABEL = os.getenv("NO_POTHOLE_LABEL", "No pothole")
 
 DEFAULT_ADDRESS = {
     "street": "Unknown street",
@@ -187,14 +192,21 @@ def parse_prediction(prediction, class_names):
 
     if scores.size == 1:
         pothole_score = float(scores[0])
-        label = class_names[0]
-        return label, pothole_score, pothole_score >= POTHOLE_THRESHOLD
+        pothole_label = class_names[0]
+        if pothole_score >= POTHOLE_THRESHOLD:
+            return pothole_label, pothole_score, True
+        return NO_POTHOLE_LABEL, 1.0 - pothole_score, False
 
     index = int(np.argmax(scores))
     label = class_names[index] if index < len(class_names) else f"class_{index}"
     confidence = float(scores[index])
     is_pothole = "pothole" in label.lower() and confidence >= POTHOLE_THRESHOLD
     return label, confidence, is_pothole
+
+
+def prediction_score(prediction):
+    scores = np.asarray(prediction[0]).astype(np.float32).flatten()
+    return float(scores[0]) if scores.size == 1 else float(np.max(scores))
 
 
 def run_detection():
@@ -213,8 +225,9 @@ def run_detection():
     print("Smart Road Quality Monitoring Started")
     print(f"Model: {MODEL_PATH.name}")
     print(f"Labels: {LABELS_PATH.name}")
-    print("Show a pothole image/video to the webcam")
-    print("Press P for a severe pothole, R to refresh location, Q to quit")
+    print("Keep the camera on a normal non-pothole scene for initial calibration.")
+    print("Then show a pothole image/video to the webcam.")
+    print("Press C to recalibrate, P for severe pothole, R to refresh location, Q to quit")
     print("=" * 50)
 
     lat, lng, address = get_report_location()
@@ -224,6 +237,9 @@ def run_detection():
     )
 
     last_report_time = 0.0
+    stable_pothole_frames = 0
+    calibration_scores = []
+    dynamic_threshold = POTHOLE_THRESHOLD
 
     try:
         while True:
@@ -234,9 +250,27 @@ def run_detection():
 
             image = preprocess_frame(frame, model.input_shape)
             prediction = model.predict(image, verbose=0)
-            class_name, confidence_score, is_pothole = parse_prediction(
-                prediction, class_names
-            )
+            pothole_score = prediction_score(prediction)
+
+            if len(calibration_scores) < CALIBRATION_FRAMES:
+                calibration_scores.append(pothole_score)
+                dynamic_threshold = min(
+                    MAX_DYNAMIC_THRESHOLD,
+                    max(POTHOLE_THRESHOLD, max(calibration_scores) + CALIBRATION_MARGIN),
+                )
+                class_name = "Calibrating"
+                confidence_score = pothole_score
+                is_pothole = False
+            else:
+                class_name, confidence_score, is_pothole = parse_prediction(
+                    prediction, class_names
+                )
+                if pothole_score < dynamic_threshold:
+                    class_name = NO_POTHOLE_LABEL
+                    confidence_score = 1.0 - pothole_score
+                    is_pothole = False
+
+            stable_pothole_frames = stable_pothole_frames + 1 if is_pothole else 0
 
             overlay_color = (0, 0, 255) if is_pothole else (0, 255, 0)
             cv2.putText(
@@ -248,13 +282,27 @@ def run_detection():
                 overlay_color,
                 2,
             )
+            cv2.putText(
+                frame,
+                f"score={pothole_score:.3f} threshold={dynamic_threshold:.3f}",
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
 
             current_time = time.time()
-            if is_pothole and (current_time - last_report_time) > REPORT_INTERVAL:
+            if (
+                is_pothole
+                and stable_pothole_frames >= STABLE_DETECTION_FRAMES
+                and (current_time - last_report_time) > REPORT_INTERVAL
+            ):
                 lat, lng, address = get_report_location()
 
                 print("Pothole detected")
                 print(f"Confidence: {confidence_score:.2f}")
+                print(f"Stable frames: {stable_pothole_frames}")
                 print(f"Location: {lat}, {lng}")
 
                 Thread(
@@ -288,6 +336,11 @@ def run_detection():
                     f"Location refreshed: {lat}, {lng} | "
                     f"{address['street']}, {address['area']} {address['pincode']}"
                 )
+            if key in (ord("c"), ord("C")):
+                calibration_scores = []
+                dynamic_threshold = POTHOLE_THRESHOLD
+                stable_pothole_frames = 0
+                print("Calibration reset. Show a normal non-pothole scene for a few seconds.")
     finally:
         cap.release()
         cv2.destroyAllWindows()
