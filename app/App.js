@@ -4,21 +4,35 @@ import {
   Text,
   StyleSheet,
   Alert,
-  ActivityIndicator,
   Platform,
   SafeAreaView,
   ScrollView,
+  RefreshControl,
 } from "react-native";
 import axios from "axios";
 import * as Location from "expo-location";
+import { LinearGradient } from "expo-linear-gradient";
+
+// Components
 import PotholeMap from "./components/PotholeMap";
+import ModernHeader from "./components/ModernHeader";
+import LoadingScreen from "./components/LoadingScreen";
+import EmptyState from "./components/EmptyState";
+import GlassCard from "./components/GlassCard";
+import AnimatedStatCard from "./components/AnimatedStatCard";
+import AIInsightCard from "./components/AIInsightCard";
+import PotholeBottomSheet from "./components/PotholeBottomSheet";
+import FloatingActionButton from "./components/FloatingActionButton";
+
+// Theme
+import { colors, spacing, typography } from "./theme/colors";
 
 /**
  * Smart Road Quality Monitoring System - React Native App
- * Displays potholes on a map with real-time updates
+ * Modern, premium smart-city dashboard for real-time pothole detection
  */
 
-const BACKEND_IP = "192.168.1.100"; // Use your laptop's IP for Expo Go on a phone.
+const BACKEND_IP = "192.168.1.100";
 const BACKEND_PORT = 3000;
 const BACKEND_HOST =
   Platform.OS === "web"
@@ -35,17 +49,17 @@ const DEFAULT_REGION = {
   longitudeDelta: 0.05,
 };
 
-// Severity colors
+// Modern severity colors
 const SEVERITY_COLORS = {
-  1: "#4CAF50", // Green - Small
-  2: "#FFC107", // Yellow - Medium
-  3: "#F44336", // Red - Large
+  1: colors.low,
+  2: colors.medium,
+  3: colors.critical,
 };
 
 const SEVERITY_LABELS = {
-  1: "Small (Low)",
-  2: "Medium",
-  3: "Large (Critical)",
+  1: "Low Impact",
+  2: "Medium Impact",
+  3: "Critical",
 };
 
 export default function App() {
@@ -54,6 +68,10 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [error, setError] = useState(null);
   const [currentRegion, setCurrentRegion] = useState(DEFAULT_REGION);
+  const [refreshing, setRefreshing] = useState(false);
+  const [selectedPothole, setSelectedPothole] = useState(null);
+  const [bottomSheetVisible, setBottomSheetVisible] = useState(false);
+  const [systemStatus, setSystemStatus] = useState("online");
 
   /**
    * Fetch potholes from backend
@@ -65,12 +83,14 @@ export default function App() {
       });
       setPotholes(response.data.potholes || []);
       setError(null);
+      setSystemStatus("online");
     } catch (err) {
       console.log("Connection error:", err.message);
       setError(`Cannot connect to backend at ${BACKEND_URL}`);
-      // Continue polling even on error
+      setSystemStatus("offline");
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
 
@@ -110,9 +130,34 @@ export default function App() {
       .join(", "),
   });
 
+  const reverseGeocode = async (lat, lng) => {
+    try {
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`
+      );
+      const data = await response.json();
+      return {
+        street: data.address?.road || "Unknown",
+        area: data.address?.suburb || data.address?.city || "Unknown",
+        pincode: data.address?.postcode || "Unknown",
+        displayName: data.display_name || "Unknown",
+      };
+    } catch (err) {
+      console.log("Reverse geocoding failed", err);
+      return {
+        street: "Unknown",
+        area: "Unknown",
+        pincode: "Unknown",
+        displayName: "Unknown",
+      };
+    }
+  };
+
   const publishCurrentDeviceLocation = async () => {
     try {
-      const permission = await Location.requestForegroundPermissionsAsync();
+      const permission =
+        await Location.requestForegroundPermissionsAsync();
+
       if (permission.status !== "granted") {
         console.log("Location permission denied");
         return;
@@ -121,14 +166,13 @@ export default function App() {
       const position = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.High,
       });
+
       const location = {
         lat: position.coords.latitude,
         lng: position.coords.longitude,
       };
-      const [reverseGeocodeResult] = await Location.reverseGeocodeAsync({
-        latitude: location.lat,
-        longitude: location.lng,
-      });
+
+      const address = await reverseGeocode(location.lat, location.lng);
 
       setCurrentRegion({
         latitude: location.lat,
@@ -139,12 +183,11 @@ export default function App() {
 
       await axios.post(
         `${BACKEND_URL}/device-location`,
-        {
-          location,
-          address: buildAddress(reverseGeocodeResult),
-        },
+        { location, address },
         { timeout: 5000 }
       );
+
+      console.log("Location sent:", location);
     } catch (err) {
       console.log("Location publish error:", err.message);
     }
@@ -162,9 +205,9 @@ export default function App() {
       );
 
       if (response.status === 200) {
-        const action = exists ? "confirmed" : "not found";
-        Alert.alert("Success", `Pothole ${action} and updated!`);
-        fetchPotholes(); // Refresh list
+        const action = exists ? "Still Exists - Confirmed" : "Resolved";
+        Alert.alert("Success", `Pothole ${action}! Thank you for the update.`);
+        fetchPotholes();
         fetchStats();
       }
     } catch (err) {
@@ -173,34 +216,14 @@ export default function App() {
   };
 
   /**
-   * Handle marker press - show confirmation dialog
+   * Handle pothole marker press
    */
-  const handleMarkerPress = (pothole) => {
-    const address = pothole.address || {};
-
-    Alert.alert(
-      "Pothole Confirmation",
-      `Severity: ${SEVERITY_LABELS[pothole.severity]}\nDetections: ${pothole.detectionCount || 1}\nConfirmations: ${pothole.count || 0}\nStreet: ${address.street || "Unknown street"}\nArea: ${address.area || "Unknown area"}\nPincode: ${address.pincode || "Unknown pincode"}`,
-      [
-        {
-          text: "Still exists (Yes)",
-          onPress: () => confirmPothole(pothole.id, true),
-          style: "destructive",
-        },
-        {
-          text: "Fixed (No)",
-          onPress: () => confirmPothole(pothole.id, false),
-          style: "default",
-        },
-        {
-          text: "Cancel",
-          style: "cancel",
-        },
-      ]
-    );
+  const handlePotholePress = (pothole) => {
+    setSelectedPothole(pothole);
+    setBottomSheetVisible(true);
   };
 
-  // Fetch potholes every second so webcam detections appear quickly.
+  // Setup data polling
   useEffect(() => {
     publishCurrentDeviceLocation();
     fetchPotholes();
@@ -219,216 +242,261 @@ export default function App() {
     };
   }, []);
 
+  if (loading) {
+    return <LoadingScreen />;
+  }
+
+  const criticalCount = stats?.severityCounts?.[3] || 0;
+  const mediumCount = stats?.severityCounts?.[2] || 0;
+  const lowCount = stats?.severityCounts?.[1] || 0;
+
   return (
-    <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.title}>WAY WATCH</Text>
-        <Text style={styles.subtitle}>Tap markers to confirm potholes</Text>
-      </View>
+    <LinearGradient
+      colors={[colors.bg_primary, colors.bg_secondary]}
+      start={{ x: 0, y: 0 }}
+      end={{ x: 0, y: 1 }}
+      style={styles.gradientContainer}
+    >
+      <SafeAreaView style={styles.container}>
+        {/* Header */}
+        <ModernHeader
+          title="WAY WATCH"
+          subtitle="Smart Road Monitoring"
+          statusIndicator={systemStatus}
+        />
 
-      {error && (
-        <View style={styles.errorContainer}>
-          <Text style={styles.errorText}>⚠️ {error}</Text>
-          <Text style={styles.errorSubtext}>
-            Start the backend with: cd backend && npm start
-          </Text>
-        </View>
-      )}
+        {/* Error Banner */}
+        {error && (
+          <GlassCard
+            style={styles.errorBanner}
+            shadow="md"
+            hasGradient={false}
+          >
+            <Text style={[styles.errorText, typography.body_sm]}>
+              ⚠️ {error}
+            </Text>
+            <Text style={[styles.errorSubtext, typography.caption]}>
+              Start backend: cd backend && npm start
+            </Text>
+          </GlassCard>
+        )}
 
-      {loading ? (
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#2196F3" />
-          <Text style={styles.loadingText}>Connecting to backend...</Text>
-        </View>
-      ) : (
-        <>
-          <PotholeMap
-            initialRegion={currentRegion}
-            potholes={potholes}
-            severityColors={SEVERITY_COLORS}
-            severityLabels={SEVERITY_LABELS}
-            onPotholePress={handleMarkerPress}
-          />
-
+        {/* Main Content */}
+        <ScrollView
+          style={styles.content}
+          contentContainerStyle={styles.contentContainer}
+          showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => {
+                setRefreshing(true);
+                fetchPotholes();
+                fetchStats();
+              }}
+              tintColor={colors.primary}
+            />
+          }
+        >
+          {/* Dashboard Stats */}
           {stats && (
-            <View style={styles.statsContainer}>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                <View style={styles.statBox}>
-                  <Text style={styles.statLabel}>Total Potholes</Text>
-                  <Text style={styles.statValue}>{stats.totalPotholes}</Text>
-                </View>
-                <View style={styles.statBox}>
-                  <Text style={styles.statLabel}>Critical (Red)</Text>
-                  <Text style={[styles.statValue, { color: SEVERITY_COLORS[3] }]}>
-                    {stats.severityCounts[3]}
-                  </Text>
-                </View>
-                <View style={styles.statBox}>
-                  <Text style={styles.statLabel}>Medium (Yellow)</Text>
-                  <Text style={[styles.statValue, { color: SEVERITY_COLORS[2] }]}>
-                    {stats.severityCounts[2]}
-                  </Text>
-                </View>
-                <View style={styles.statBox}>
-                  <Text style={styles.statLabel}>Low (Green)</Text>
-                  <Text style={[styles.statValue, { color: SEVERITY_COLORS[1] }]}>
-                    {stats.severityCounts[1]}
-                  </Text>
-                </View>
-                <View style={styles.statBox}>
-                  <Text style={styles.statLabel}>Confirmations</Text>
-                  <Text style={styles.statValue}>
-                    {stats.totalConfirmations}
-                  </Text>
-                </View>
-              </ScrollView>
-            </View>
-          )}
-
-          {potholes.length === 0 && !loading && (
-            <View style={styles.emptyContainer}>
-              <Text style={styles.emptyText}>✓ No potholes detected!</Text>
-              <Text style={styles.emptySubtext}>
-                Road is in good condition
+            <View style={styles.section}>
+              <Text style={[styles.sectionTitle, typography.h3]}>
+                System Overview
               </Text>
+
+              <View style={styles.statsGrid}>
+                <View style={styles.statColumn}>
+                  <AnimatedStatCard
+                    label="Total Issues"
+                    value={stats.totalPotholes || 0}
+                    icon="🚨"
+                    color={colors.primary}
+                    unit=""
+                  />
+                </View>
+                <View style={styles.statColumn}>
+                  <AnimatedStatCard
+                    label="Critical"
+                    value={criticalCount}
+                    icon="🔴"
+                    color={colors.critical}
+                    unit=""
+                  />
+                </View>
+              </View>
+
+              <View style={styles.statsGrid}>
+                <View style={styles.statColumn}>
+                  <AnimatedStatCard
+                    label="Medium"
+                    value={mediumCount}
+                    icon="🟡"
+                    color={colors.medium}
+                    unit=""
+                  />
+                </View>
+                <View style={styles.statColumn}>
+                  <AnimatedStatCard
+                    label="Low"
+                    value={lowCount}
+                    icon="🟢"
+                    color={colors.low}
+                    unit=""
+                  />
+                </View>
+              </View>
+
+              <AnimatedStatCard
+                label="Community Confirmations"
+                value={stats.totalConfirmations || 0}
+                icon="👥"
+                color={colors.secondary}
+                trend={{
+                  value: "↑ 12",
+                  isPositive: true,
+                }}
+              />
             </View>
           )}
-        </>
-      )}
 
-      <View style={styles.legend}>
-        <View style={styles.legendItem}>
-          <View
-            style={[styles.legendColor, { backgroundColor: SEVERITY_COLORS[3] }]}
-          />
-          <Text style={styles.legendLabel}>Critical</Text>
-        </View>
-        <View style={styles.legendItem}>
-          <View
-            style={[styles.legendColor, { backgroundColor: SEVERITY_COLORS[2] }]}
-          />
-          <Text style={styles.legendLabel}>Medium</Text>
-        </View>
-        <View style={styles.legendItem}>
-          <View
-            style={[styles.legendColor, { backgroundColor: SEVERITY_COLORS[1] }]}
-          />
-          <Text style={styles.legendLabel}>Low</Text>
-        </View>
-      </View>
-    </SafeAreaView>
+          {/* AI Insights Section */}
+          <View style={styles.section}>
+            <Text style={[styles.sectionTitle, typography.h3]}>
+              AI Insights
+            </Text>
+
+            {criticalCount > 0 && (
+              <AIInsightCard
+                title="Critical Zones Detected"
+                description={`${criticalCount} critical potholes detected. Immediate action recommended for road safety.`}
+                severity="critical"
+                icon="⚠️"
+                actionText="View Details"
+                onPress={() => {}}
+              />
+            )}
+
+            {mediumCount > 0 && (
+              <AIInsightCard
+                title="Maintenance Hotspots"
+                description={`${mediumCount} medium-impact issues identified. Schedule preventive maintenance.`}
+                severity="warning"
+                icon="🔧"
+                actionText="Plan Repairs"
+              />
+            )}
+
+            <AIInsightCard
+              title="Road Health Status"
+              description={
+                potholes.length === 0
+                  ? "Excellent condition! Roads are well-maintained."
+                  : `${potholes.length} issues monitored. Continuous surveillance active.`
+              }
+              severity={potholes.length === 0 ? "info" : "warning"}
+              icon="🏥"
+              actionText="Full Report"
+            />
+          </View>
+
+          {/* Map Section */}
+          <View style={styles.section}>
+            <Text style={[styles.sectionTitle, typography.h3]}>
+              Detected Issues Map
+            </Text>
+
+            <GlassCard hasGradient={true} style={styles.mapContainer}>
+              <PotholeMap
+                initialRegion={currentRegion}
+                potholes={potholes}
+                severityColors={SEVERITY_COLORS}
+                severityLabels={SEVERITY_LABELS}
+                onPotholePress={handlePotholePress}
+              />
+            </GlassCard>
+          </View>
+
+          {/* Empty State */}
+          {potholes.length === 0 && <EmptyState />}
+        </ScrollView>
+
+        {/* Floating Action Button - Refresh */}
+        <FloatingActionButton
+          onPress={() => {
+            setRefreshing(true);
+            fetchPotholes();
+            fetchStats();
+          }}
+          icon="🔄"
+          variant="primary"
+          size="lg"
+          position="bottom-right"
+        />
+
+        {/* Bottom Sheet Modal */}
+        <PotholeBottomSheet
+          visible={bottomSheetVisible}
+          pothole={selectedPothole}
+          onClose={() => setBottomSheetVisible(false)}
+          onConfirm={confirmPothole}
+          severityLabels={SEVERITY_LABELS}
+        />
+      </SafeAreaView>
+    </LinearGradient>
   );
 }
 
 const styles = StyleSheet.create({
+  gradientContainer: {
+    flex: 1,
+  },
   container: {
     flex: 1,
-    backgroundColor: "#f5f5f5",
   },
-  header: {
-    backgroundColor: "#2196F3",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: "bold",
-    color: "white",
-  },
-  subtitle: {
-    fontSize: 12,
-    color: "#e3f2fd",
-    marginTop: 4,
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  loadingText: {
-    marginTop: 12,
-    fontSize: 16,
-    color: "#666",
-  },
-  errorContainer: {
-    backgroundColor: "#ffebee",
-    borderBottomWidth: 2,
-    borderBottomColor: "#f44336",
-    padding: 12,
+  errorBanner: {
+    marginHorizontal: spacing.md,
+    marginTop: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.critical,
+    padding: spacing.md,
   },
   errorText: {
-    fontSize: 14,
+    color: colors.critical,
     fontWeight: "600",
-    color: "#c62828",
   },
   errorSubtext: {
-    fontSize: 12,
-    color: "#d32f2f",
-    marginTop: 4,
+    color: colors.critical_light,
+    marginTop: spacing.xs,
   },
-  emptyContainer: {
+  content: {
     flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
   },
-  emptyText: {
-    fontSize: 18,
-    fontWeight: "600",
-    color: "#4CAF50",
+  contentContainer: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.lg,
+    paddingBottom: spacing.xxl,
   },
-  emptySubtext: {
-    fontSize: 14,
-    color: "#888",
-    marginTop: 8,
+  section: {
+    marginBottom: spacing.xxl,
   },
-  statsContainer: {
-    backgroundColor: "white",
-    paddingVertical: 8,
-    borderTopWidth: 1,
-    borderTopColor: "#e0e0e0",
-    maxHeight: 100,
+  sectionTitle: {
+    color: colors.text_primary,
+    fontWeight: "700",
+    marginBottom: spacing.lg,
+    letterSpacing: 0.5,
   },
-  statBox: {
-    marginHorizontal: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: "#f5f5f5",
-    borderRadius: 8,
-    alignItems: "center",
-    minWidth: 90,
-  },
-  statLabel: {
-    fontSize: 11,
-    color: "#666",
-    fontWeight: "600",
-  },
-  statValue: {
-    fontSize: 18,
-    fontWeight: "bold",
-    color: "#2196F3",
-    marginTop: 4,
-  },
-  legend: {
-    backgroundColor: "white",
+  statsGrid: {
     flexDirection: "row",
-    justifyContent: "space-around",
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#e0e0e0",
+    gap: spacing.md,
+    marginBottom: spacing.md,
   },
-  legendItem: {
-    flexDirection: "row",
-    alignItems: "center",
+  statColumn: {
+    flex: 1,
   },
-  legendColor: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    marginRight: 6,
-  },
-  legendLabel: {
-    fontSize: 12,
-    color: "#666",
+  mapContainer: {
+    height: 300,
+    borderRadius: 16,
+    overflow: "hidden",
   },
 });
