@@ -323,6 +323,8 @@ WAY WATCH aims to:
 
 # 👨‍💻 Team
 
-Built for **Niral Thiruvizha Hackathon** 🚀
+Built by:
+Brendan Wesley - Freddy Selvanathan - Aaron Morais
+
 
 WAY WATCH — Reimagining Road Infrastructure with AI.
